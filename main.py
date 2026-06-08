@@ -324,6 +324,69 @@ def upgrade_all_items(tm):
 
     print(colored("[UPGRADE]", GREEN) + colored(" All items upgraded to max level.", GRAY))
 
+# ------------------------------------------------------------
+# توابع اصلاح شده برای claim کردن با تأیید ایندکس واقعی
+# ------------------------------------------------------------
+def claim_with_verification(tm, line_index, line_name, max_retries=3):
+    """
+    Claim یک خط (Money=0 یا Gold=1) را انجام می‌دهد و تا زمانی که ایندکس واقعی آن خط
+    افزایش پیدا نکند، دوباره تلاش می‌کند. در نهایت مقدار جایزه را برمی‌گرداند.
+    """
+    # 1. گرفتن ایندکس فعلی (قبل از claim)
+    status_before = check_reward_status(tm)
+    idx_before, _, total, _ = parse_status(status_before)
+    if idx_before is None:
+        print(colored("[ERROR]", YELLOW) + " Could not parse status before claim")
+        return None
+    
+    # اگر ایندکس خط مورد نظر:
+    if line_index == 0:
+        current_idx = idx_before
+    else:
+        _, idx_before_gold, _, _ = parse_status(status_before)
+        current_idx = idx_before_gold
+    
+    # 2. حلقه claim با حداکثر max_retries
+    for attempt in range(max_retries):
+        claim_resp = claim_free_wall(tm, line_index)
+        if claim_resp.get("code") != 200:
+            print(colored("[RETRY]", YELLOW) + colored(f" Claim {line_name} attempt {attempt+1} failed: {claim_resp}", GRAY))
+            time.sleep(1)
+            continue
+        
+        # 3. بعد از claim، وضعیت جدید را بگیر
+        status_after = check_reward_status(tm)
+        idx_after, idx_after_gold, _, _ = parse_status(status_after)
+        if line_index == 0:
+            new_idx = idx_after
+        else:
+            new_idx = idx_after_gold
+        
+        # 4. بررسی افزایش ایندکس
+        if new_idx is not None and new_idx > current_idx:
+            # موفقیت آمیز: ایندکس افزایش یافته است
+            # استخراج مقدار جایزه (در صورت وجود)
+            last_reward = claim_resp.get("data", {}).get("FunctionResult", {}).get("Progress", {}).get("lastReward")
+            if last_reward and "rC" in last_reward:
+                amount = last_reward["rC"]
+                print(colored("[CLAIM]", GREEN) + colored(f" >>> {line_name}: +{amount}  ", LIGHT_PURPLE))
+                return amount
+            else:
+                # ایندکس افزایش یافته ولی مقدار در پاسخ نیامده – باز هم موفق است
+                print(colored("[CLAIM]", GREEN) + colored(f" >>> {line_name}: OK (index increased from {current_idx} to {new_idx})", LIGHT_PURPLE))
+                return 0  # مقدار نامشخص ولی claim انجام شده
+        else:
+            # ایندکس افزایش نیافته => Claim واقعاً انجام نشده، دوباره تلاش کن
+            print(colored("[WARN]", YELLOW) + colored(f" Index for {line_name} didn't increase (was {current_idx}, still {new_idx}), retrying...", GRAY))
+            time.sleep(1.5)
+    
+    # بعد از تمام تلاش‌ها موفق نشد
+    print(colored("[ERROR]", YELLOW) + colored(f" Failed to claim {line_name} after {max_retries} attempts", GRAY))
+    return None
+
+# ------------------------------------------------------------
+# حلقه اصلی (با به‌روزرسانی وضعیت بعد از هر Claim)
+# ------------------------------------------------------------
 def main():
     print(colored("=" * 55, DARK_PURPLE))
     print(colored(">>> HAZMOB FREE WALL AUTO CLAIM (MONEY + GOLD) <<<", LIGHT_PURPLE))
@@ -357,7 +420,9 @@ def main():
             wait_until_reset(reset_time, tm)
             continue
 
+        # حلقه Claim تا زمانی که هر دو خط تمام شوند
         while money_remaining > 0 or gold_remaining > 0:
+            # مرحله 1: ReportAd + RewardAd (مشترک برای هر Claim)
             r1 = report_ad(tm, FREE_WALL_PLACEMENT, FREE_WALL_REWARD)
             if r1.get("code") != 200:
                 print(colored("[WARN]", YELLOW) + colored(f" ReportAd failed: {r1}", GRAY))
@@ -369,33 +434,37 @@ def main():
                 time.sleep(1)
                 continue
 
+            # تصمیم بگیریم کدام خط را Claim کنیم (اولویت با خطی که جایزه بیشتری دارد)
+            # برای تنوع، الگوریتم قبلی: اگر مقدار مانی باقیمانده بیشتر یا مساوی طلا، مانی بگیر
+            # در غیر این صورت طلا.
+            # اما مهم نیست، چون حلقه تا اتمام ادامه می‌یابد.
             if money_remaining >= gold_remaining and money_remaining > 0:
                 line = 0
                 name = "Money"
-                money_remaining -= 1
+                claimed_amount = claim_with_verification(tm, line, name)
+                if claimed_amount is not None:
+                    money_remaining -= 1  # کاهش محلی (بعداً دوباره از سرور می‌گیریم)
             elif gold_remaining > 0:
                 line = 1
                 name = "Gold"
-                gold_remaining -= 1
+                claimed_amount = claim_with_verification(tm, line, name)
+                if claimed_amount is not None:
+                    gold_remaining -= 1
             else:
                 break
 
-            claim_resp = claim_free_wall(tm, line)
-            if claim_resp.get("code") == 200:
-                last = claim_resp.get("data", {}).get("FunctionResult", {}).get("Progress", {}).get("lastReward")
-                if last:
-                    amount = last.get("rC")
-                    print(colored("[CLAIM]", GREEN) + colored(f" >>> {name}: +{amount}  ", LIGHT_PURPLE) + colored(f"(Remaining: {money_remaining if line==0 else gold_remaining})", GRAY))
-                else:
-                    print(colored("[CLAIM]", GREEN) + colored(f" >>> {name}: OK", LIGHT_PURPLE))
+            # پس از هر Claim، وضعیت را دوباره از سرور دریافت می‌کنیم تا مقادیر دقیق باشند
+            # این کار هرگونه مغایرت را برطرف می‌کند
+            status = check_reward_status(tm)
+            idx0, idx1, total, reset_time = parse_status(status)
+            if idx0 is not None:
+                money_remaining = total - idx0
+                gold_remaining = total - idx1
             else:
-                print(colored("[ERROR]", YELLOW) + colored(f" Claim failed for {name}: {claim_resp}", GRAY))
-                if line == 0:
-                    money_remaining += 1
-                else:
-                    gold_remaining += 1
+                print(colored("[ERROR]", YELLOW) + " Could not re-parse status, waiting 2s...", GRAY)
+                time.sleep(2)
 
-            time.sleep(1)
+            time.sleep(1.5)  # تأخیر کوتاه بین Claimها
 
         print(colored("[INFO]", YELLOW) + colored(" Both lines completed for this cycle. Waiting for reset...", GRAY))
         wait_until_reset(reset_time, tm)
