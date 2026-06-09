@@ -1,11 +1,10 @@
 import asyncio
 import logging
-import os
 import re
 import mysql.connector
 from telethon import TelegramClient, events
 from telethon.tl.types import Message, DocumentAttributeFilename
-from telethon.errors import FloodWaitError
+from datetime import datetime
 
 # ---------- Settings ----------
 API_ID = 20579339
@@ -21,122 +20,96 @@ DB_CONFIG = {
     'port': 3306
 }
 
-# ---------- Targets & Logic ----------
-STARRED_CHANNELS = ["AmyraxVPN", "prrofile_purple", "vpn11ir", "hex_proxy"]
-HEX_PROXY_LIMIT = 10
+# ---------- Project Logic Settings ----------
+STARED_CHANNELS = ["@AmyraxVPN", "@prrofile_purple", "@vpn11ir", "@hex_proxy"]
+SPECIAL_LIMIT_CHANNEL = "@hex_proxy"
 DEFAULT_LIMIT = 5
+SPECIAL_LIMIT = 10
 
 # Regex Patterns
-CONFIG_PATTERN = r"(vless|vmess|trojan|ss):\/\/[^\s]+"
-PROXY_PATTERN = r"(https?:\/\/t\.me\/proxy\?[^\s]+|tg:\/\/proxy\?[^\s]+)"
+PROXY_PATTERN = r"(https?://t\.me/proxy\?server=[^\s]+)"
+CONFIG_PATTERNS = r"(vless://[^\s]+|vmess://[^\s]+|trojan://[^\s]+|ss://[^\s]+)"
 
-def get_db_connection():
-    try:
-        return mysql.connector.connect(**DB_CONFIG)
-    except Exception as e:
-        print(f"Database connection error: {e}")
-        return None
+async def get_db_connection():
+    return mysql.connector.connect(**DB_CONFIG)
 
-def setup_db():
-    conn = get_db_connection()
-    if conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS telegram_items (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                channel_name VARCHAR(255),
-                category VARCHAR(50),
-                content TEXT,
-                filename VARCHAR(255),
-                is_starred BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
-        cursor.close()
-        conn.close()
+async def clear_database(cursor, conn):
+    cursor.execute("TRUNCATE TABLE items") # Assume table name is 'items'
+    conn.commit()
 
-async def scrape_channels(client):
-    print("Starting scraping cycle...")
-    conn = get_db_connection()
-    if not conn:
-        return
+async def scrape_telegram():
+    client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+    await client.start()
     
+    conn = await get_db_connection()
     cursor = conn.cursor()
-    # Clear old data
-    cursor.execute("DELETE FROM telegram_items")
+    
+    # 1. Clear DB before starting
+    cursor.execute("DELETE FROM vpn_items") # Change to your table name
     conn.commit()
 
     async for dialog in client.iter_dialogs():
         if not dialog.is_channel:
             continue
-
-        username = dialog.entity.username
-        if not username:
-            continue
-
-        is_starred = username.lower() in [s.lower() for s in STARRED_CHANNELS]
-        limit = HEX_PROXY_LIMIT if username.lower() == "hex_proxy" else DEFAULT_LIMIT
         
+        username = f"@{dialog.entity.username}" if dialog.entity.username else "Private"
+        is_stared = 1 if username in STARED_CHANNELS else 0
+        limit = SPECIAL_LIMIT if username == SPECIAL_LIMIT_CHANNEL else DEFAULT_LIMIT
+        
+        print(f"Scraping {username}...")
         found_count = 0
-        async for message in client.iter_messages(dialog.id, limit=50): # Look back further to find specific items
+        
+        async for message in client.iter_messages(dialog.entity, limit=100):
             if found_count >= limit:
                 break
-
-            category = None
-            content = None
-            filename = None
+            
+            item_data = None
+            item_type = None
+            file_name = None
 
             # 1. Check for NPVT Files
-            if message.file and message.file.ext == ".npvt":
-                category = "npvt"
-                # Store message ID or some reference to download later, or store the content if it's text
-                # For simulation, we'll store the filename and message info
-                filename = "Unknown"
-                for attr in message.document.attributes:
-                    if isinstance(attr, DocumentAttributeFilename):
-                        filename = attr.file_name
-                content = f"msg_id_{message.id}" # Placeholder for actual file logic
-                
-            # 2. Check for Proxy Links
+            if message.file and message.file.name and message.file.name.endswith(".npvt"):
+                item_type = "napster"
+                file_name = message.file.name
+                # Store content or reference
+                item_data = message.text if message.text else file_name
+                found_count += 1
+
+            # 2. Check for Proxy Links in text
             elif message.text:
                 proxies = re.findall(PROXY_PATTERN, message.text)
                 if proxies:
-                    category = "proxy"
-                    content = proxies[0]
+                    item_type = "proxy"
+                    item_data = proxies[0]
+                    found_count += 1
                 
-                # 3. Check for Configs
+                # 3. Check for V2Ray Configs
                 else:
-                    configs = re.findall(CONFIG_PATTERN, message.text)
+                    configs = re.findall(CONFIG_PATTERNS, message.text)
                     if configs:
-                        category = "config"
-                        content = configs[0]
+                        item_type = "config"
+                        item_data = configs[0]
+                        found_count += 1
 
-            if category and content:
-                cursor.execute(
-                    "INSERT INTO telegram_items (channel_name, category, content, filename, is_starred) VALUES (%s, %s, %s, %s, %s)",
-                    (username, category, content, filename, is_starred)
-                )
-                found_count += 1
+            if item_type and item_data:
+                query = "INSERT INTO vpn_items (type, channel, content, file_name, is_stared) VALUES (%s, %s, %s, %s, %s)"
+                cursor.execute(query, (item_type, username, item_data, file_name, is_stared))
                 conn.commit()
 
+    await client.disconnect()
     cursor.close()
     conn.close()
-    print("Scraping cycle finished.")
 
-async def main():
-    setup_db()
-    client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
-    await client.start()
-
+async def main_loop():
     while True:
+        print("Starting scheduled scrap...")
         try:
-            await scrape_channels(client)
+            await scrape_telegram()
+            print("Scraping finished. Waiting 30 minutes...")
         except Exception as e:
-            print(f"Error during scrape: {e}")
+            print(f"Error occurred: {e}")
         
-        print("Sleeping for 30 minutes...")
-        await asyncio.sleep(1800)
+        await asyncio.sleep(1800) # 30 minutes
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main_loop())
