@@ -1,115 +1,175 @@
 import asyncio
 import logging
 import re
+import io
 import mysql.connector
-from telethon import TelegramClient, events
-from telethon.tl.types import Message, DocumentAttributeFilename
+from telethon import TelegramClient
+from telethon.tl.types import (
+    Channel, DocumentAttributeFilename, MessageMediaDocument
+)
 from datetime import datetime
 
-# ---------- Settings ----------
-API_ID = 20579339
-API_HASH = "46188ecc09a9b8d3f934d280b19c1f39"
-SESSION_FILE = "my_session"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger(__name__)
 
-# ---------- Database Config ----------
-DB_CONFIG = {
-    'host': 'sql12.freesqldatabase.com',
-    'database': 'sql12829888',
-    'user': 'sql12829888',
-    'password': 'X7YNr1iUEt',
-    'port': 3306
+# ---------- Settings ----------
+API_ID   = 20579339
+API_HASH = "46188ecc09a9b8d3f934d280b19c1f39"
+SESSION  = "my_session"
+
+# ---------- Database ----------
+DB_CFG = {
+    "host":     "sql12.freesqldatabase.com",
+    "database": "sql12829888",
+    "user":     "sql12829888",
+    "password": "X7YNr1iUEt",
+    "port":     3306,
 }
 
-# ---------- Project Logic Settings ----------
-STARED_CHANNELS = ["@AmyraxVPN", "@prrofile_purple", "@vpn11ir", "@hex_proxy"]
-SPECIAL_LIMIT_CHANNEL = "@hex_proxy"
-DEFAULT_LIMIT = 5
-SPECIAL_LIMIT = 10
+# ---------- Logic Settings ----------
+STARED_CHANNELS     = {"@AmyraxVPN", "@prrofile_purple", "@vpn11ir", "@hex_proxy"}
+HEX_PROXY_CHANNEL   = "@hex_proxy"
+DEFAULT_LIMIT       = 5
+SPECIAL_LIMIT       = 10
 
-# Regex Patterns
-PROXY_PATTERN = r"(https?://t\.me/proxy\?server=[^\s]+)"
-CONFIG_PATTERNS = r"(vless://[^\s]+|vmess://[^\s]+|trojan://[^\s]+|ss://[^\s]+)"
+# ---------- Regex ----------
+RE_PROXY   = re.compile(r"https?://t\.me/proxy\?[^\s\"\'\)]+", re.IGNORECASE)
+RE_CONFIG  = re.compile(
+    r"(?:vless|vmess|trojan|ss)://[^\s\"\'\)\<\>]+",
+    re.IGNORECASE
+)
 
-async def get_db_connection():
-    return mysql.connector.connect(**DB_CONFIG)
+# ──────────────────────────────────────────────────────────────────────────────
+def get_conn():
+    return mysql.connector.connect(**DB_CFG)
 
-async def clear_database(cursor, conn):
-    cursor.execute("TRUNCATE TABLE items") # Assume table name is 'items'
-    conn.commit()
+def ensure_tables(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS vpn_items (
+            id         INT AUTO_INCREMENT PRIMARY KEY,
+            type       VARCHAR(20)  NOT NULL,
+            channel    VARCHAR(100) NOT NULL,
+            content    TEXT,
+            file_name  VARCHAR(255),
+            file_data  LONGBLOB,
+            is_stared  TINYINT(1)   DEFAULT 0,
+            created_at DATETIME     DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
-async def scrape_telegram():
-    client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
-    await client.start()
-    
-    conn = await get_db_connection()
-    cursor = conn.cursor()
-    
-    # 1. Clear DB before starting
-    cursor.execute("DELETE FROM vpn_items") # Change to your table name
+def clear_items(cur):
+    cur.execute("DELETE FROM vpn_items")
+
+def insert_item(cur, type_, channel, content, file_name, file_data, is_stared):
+    cur.execute(
+        """INSERT INTO vpn_items
+           (type, channel, content, file_name, file_data, is_stared)
+           VALUES (%s, %s, %s, %s, %s, %s)""",
+        (type_, channel, content, file_name, file_data, int(is_stared))
+    )
+
+# ──────────────────────────────────────────────────────────────────────────────
+async def scrape_all(client: TelegramClient, cur, conn):
+    log.info("Clearing old data ...")
+    clear_items(cur)
     conn.commit()
 
     async for dialog in client.iter_dialogs():
-        if not dialog.is_channel:
+        entity = dialog.entity
+
+        # Only process channels (not private chats / groups)
+        if not isinstance(entity, Channel):
             continue
-        
-        username = f"@{dialog.entity.username}" if dialog.entity.username else "Private"
-        is_stared = 1 if username in STARED_CHANNELS else 0
-        limit = SPECIAL_LIMIT if username == SPECIAL_LIMIT_CHANNEL else DEFAULT_LIMIT
-        
-        print(f"Scraping {username}...")
-        found_count = 0
-        
-        async for message in client.iter_messages(dialog.entity, limit=100):
-            if found_count >= limit:
+
+        raw_username = getattr(entity, "username", None)
+        if not raw_username:
+            continue                           # skip channels with no public @
+
+        channel_tag = f"@{raw_username}"
+        is_stared   = channel_tag in STARED_CHANNELS
+        limit       = SPECIAL_LIMIT if channel_tag == HEX_PROXY_CHANNEL else DEFAULT_LIMIT
+
+        log.info(f"Processing {channel_tag}  (limit={limit}, stared={is_stared})")
+        found = 0
+
+        async for msg in client.iter_messages(entity, limit=200):
+            if found >= limit:
                 break
-            
-            item_data = None
-            item_type = None
-            file_name = None
 
-            # 1. Check for NPVT Files
-            if message.file and message.file.name and message.file.name.endswith(".npvt"):
-                item_type = "napster"
-                file_name = message.file.name
-                # Store content or reference
-                item_data = message.text if message.text else file_name
-                found_count += 1
+            # ── 1. NPVT file ──────────────────────────────────────────────
+            if msg.file is not None:
+                fname = None
+                for attr in (msg.media.document.attributes if msg.media and hasattr(msg.media, "document") else []):
+                    if isinstance(attr, DocumentAttributeFilename):
+                        fname = attr.file_name
+                        break
 
-            # 2. Check for Proxy Links in text
-            elif message.text:
-                proxies = re.findall(PROXY_PATTERN, message.text)
-                if proxies:
-                    item_type = "proxy"
-                    item_data = proxies[0]
-                    found_count += 1
-                
-                # 3. Check for V2Ray Configs
-                else:
-                    configs = re.findall(CONFIG_PATTERNS, message.text)
-                    if configs:
-                        item_type = "config"
-                        item_data = configs[0]
-                        found_count += 1
+                if fname and fname.lower().endswith(".npvt"):
+                    log.info(f"  Downloading npvt: {fname}")
+                    try:
+                        buf = io.BytesIO()
+                        await client.download_media(msg, file=buf)
+                        file_bytes = buf.getvalue()
+                    except Exception as e:
+                        log.warning(f"  Failed to download {fname}: {e}")
+                        file_bytes = None
 
-            if item_type and item_data:
-                query = "INSERT INTO vpn_items (type, channel, content, file_name, is_stared) VALUES (%s, %s, %s, %s, %s)"
-                cursor.execute(query, (item_type, username, item_data, file_name, is_stared))
-                conn.commit()
+                    insert_item(cur, "napster", channel_tag,
+                                fname, fname, file_bytes, is_stared)
+                    conn.commit()
+                    found += 1
+                    continue
 
-    await client.disconnect()
-    cursor.close()
-    conn.close()
+            # ── 2. Text-based content ─────────────────────────────────────
+            text = msg.text or ""
+            if not text:
+                continue
 
-async def main_loop():
+            # Proxy links first
+            proxies = RE_PROXY.findall(text)
+            if proxies:
+                for proxy_url in proxies:
+                    if found >= limit:
+                        break
+                    insert_item(cur, "proxy", channel_tag,
+                                proxy_url, None, None, is_stared)
+                    conn.commit()
+                    found += 1
+                continue
+
+            # V2Ray / SS configs
+            configs = RE_CONFIG.findall(text)
+            if configs:
+                for cfg in configs:
+                    if found >= limit:
+                        break
+                    insert_item(cur, "config", channel_tag,
+                                cfg, None, None, is_stared)
+                    conn.commit()
+                    found += 1
+
+    log.info("Scrape finished.")
+
+# ──────────────────────────────────────────────────────────────────────────────
+async def main():
+    client = TelegramClient(SESSION, API_ID, API_HASH)
+    await client.start()
+    log.info("Telegram client started.")
+
+    conn = get_conn()
+    cur  = conn.cursor()
+    ensure_tables(cur)
+    conn.commit()
+
     while True:
-        print("Starting scheduled scrap...")
+        log.info("=== Starting scheduled scrape ===")
         try:
-            await scrape_telegram()
-            print("Scraping finished. Waiting 30 minutes...")
-        except Exception as e:
-            print(f"Error occurred: {e}")
-        
-        await asyncio.sleep(1800) # 30 minutes
+            await scrape_all(client, cur, conn)
+        except Exception as exc:
+            log.exception(f"Scrape error: {exc}")
+
+        log.info("Sleeping 30 minutes ...")
+        await asyncio.sleep(1800)
 
 if __name__ == "__main__":
-    asyncio.run(main_loop())
+    asyncio.run(main())
