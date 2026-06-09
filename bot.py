@@ -1,175 +1,285 @@
 import asyncio
 import logging
+import os
 import re
-import io
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
 import mysql.connector
 from telethon import TelegramClient
-from telethon.tl.types import (
-    Channel, DocumentAttributeFilename, MessageMediaDocument
-)
-from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger(__name__)
 
-# ---------- Settings ----------
-API_ID   = 20579339
-API_HASH = "46188ecc09a9b8d3f934d280b19c1f39"
-SESSION  = "my_session"
+API_ID = int(os.getenv("API_ID", "20579339"))
+API_HASH = os.getenv("API_HASH", "46188ecc09a9b8d3f934d280b19c1f39")
+SESSION_FILE = os.getenv("SESSION_FILE", "my_session")
 
-# ---------- Database ----------
-DB_CFG = {
-    "host":     "sql12.freesqldatabase.com",
-    "database": "sql12829888",
-    "user":     "sql12829888",
-    "password": "X7YNr1iUEt",
-    "port":     3306,
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "sql12.freesqldatabase.com"),
+    "database": os.getenv("DB_NAME", "sql12829888"),
+    "user": os.getenv("DB_USER", "sql12829888"),
+    "password": os.getenv("DB_PASSWORD", "X7YNr1iUEt"),
+    "port": int(os.getenv("DB_PORT", "3306")),
 }
 
-# ---------- Logic Settings ----------
-STARED_CHANNELS     = {"@AmyraxVPN", "@prrofile_purple", "@vpn11ir", "@hex_proxy"}
-HEX_PROXY_CHANNEL   = "@hex_proxy"
-DEFAULT_LIMIT       = 5
-SPECIAL_LIMIT       = 10
+TABLE_NAME = os.getenv("TABLE_NAME", "telegram_items")
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 
-# ---------- Regex ----------
-RE_PROXY   = re.compile(r"https?://t\.me/proxy\?[^\s\"\'\)]+", re.IGNORECASE)
-RE_CONFIG  = re.compile(
-    r"(?:vless|vmess|trojan|ss)://[^\s\"\'\)\<\>]+",
-    re.IGNORECASE
-)
+STARRED_CHANNELS = {
+    "@AmyraxVPN",
+    "@prrofile_purple",
+    "@vpn11ir",
+    "@hex_proxy",
+}
 
-# ──────────────────────────────────────────────────────────────────────────────
-def get_conn():
-    return mysql.connector.connect(**DB_CFG)
+DEFAULT_LIMIT = 5
+SPECIAL_LIMITS = {
+    "@hex_proxy": 10,
+}
 
-def ensure_tables(cur):
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS vpn_items (
-            id         INT AUTO_INCREMENT PRIMARY KEY,
-            type       VARCHAR(20)  NOT NULL,
-            channel    VARCHAR(100) NOT NULL,
-            content    TEXT,
-            file_name  VARCHAR(255),
-            file_data  LONGBLOB,
-            is_stared  TINYINT(1)   DEFAULT 0,
-            created_at DATETIME     DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+NPVT_EXT = ".npvt"
+PROXY_RE = re.compile(r"https?://t\.me/proxy\?[^\s<>\"']+", re.IGNORECASE)
+CONFIG_RE = re.compile(r"(?:vless|vmess|trojan|ss)://[^\s<>\"']+", re.IGNORECASE)
 
-def clear_items(cur):
-    cur.execute("DELETE FROM vpn_items")
 
-def insert_item(cur, type_, channel, content, file_name, file_data, is_stared):
-    cur.execute(
-        """INSERT INTO vpn_items
-           (type, channel, content, file_name, file_data, is_stared)
-           VALUES (%s, %s, %s, %s, %s, %s)""",
-        (type_, channel, content, file_name, file_data, int(is_stared))
+@dataclass
+class ExtractedItem:
+    item_type: str
+    channel_username: str
+    channel_title: str
+    channel_starred: int
+    source_message_id: int
+    display_name: str | None = None
+    payload: str | None = None
+    file_name: str | None = None
+    local_path: str | None = None
+    source_text: str | None = None
+    created_at: str | None = None
+
+
+def get_connection():
+    return mysql.connector.connect(**DB_CONFIG)
+
+
+def ensure_schema(cursor):
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            item_type VARCHAR(32) NOT NULL,
+            channel_username VARCHAR(128) NOT NULL,
+            channel_title VARCHAR(255) NOT NULL,
+            channel_starred TINYINT(1) NOT NULL DEFAULT 0,
+            source_message_id BIGINT NOT NULL,
+            display_name VARCHAR(255) NULL,
+            payload TEXT NULL,
+            file_name VARCHAR(255) NULL,
+            local_path TEXT NULL,
+            source_text LONGTEXT NULL,
+            created_at DATETIME NOT NULL,
+            UNIQUE KEY uniq_item (item_type, channel_username, source_message_id, file_name)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        """
     )
 
-# ──────────────────────────────────────────────────────────────────────────────
-async def scrape_all(client: TelegramClient, cur, conn):
-    log.info("Clearing old data ...")
-    clear_items(cur)
+
+def clear_table(cursor):
+    cursor.execute(f"TRUNCATE TABLE {TABLE_NAME}")
+
+
+def normalize_username(entity) -> str:
+    username = getattr(entity, "username", None)
+    if username:
+        return f"@{username}"
+    title = getattr(entity, "title", None)
+    if title:
+        return title
+    return "Private"
+
+
+def extract_links(text: str):
+    if not text:
+        return []
+
+    found = []
+    seen = set()
+
+    for match in PROXY_RE.finditer(text):
+        value = match.group(0)
+        if value not in seen:
+            seen.add(value)
+            found.append(("proxy", value))
+
+    for match in CONFIG_RE.finditer(text):
+        value = match.group(0)
+        if value not in seen:
+            seen.add(value)
+            found.append(("config", value))
+
+    return found
+
+
+def is_npvt_file(message) -> bool:
+    name = getattr(getattr(message, "file", None), "name", None)
+    return bool(name and name.lower().endswith(NPVT_EXT))
+
+
+def build_display_name(message, fallback: str) -> str:
+    name = getattr(getattr(message, "file", None), "name", None)
+    if name:
+        return name
+    text = getattr(message, "message", None) or getattr(message, "text", None)
+    if text:
+        first_line = text.strip().splitlines()[0].strip()
+        if first_line:
+            return first_line[:255]
+    return fallback
+
+
+async def save_item(cursor, conn, item: ExtractedItem):
+    cursor.execute(
+        f"""
+        INSERT INTO {TABLE_NAME} (
+            item_type,
+            channel_username,
+            channel_title,
+            channel_starred,
+            source_message_id,
+            display_name,
+            payload,
+            file_name,
+            local_path,
+            source_text,
+            created_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            channel_title = VALUES(channel_title),
+            channel_starred = VALUES(channel_starred),
+            display_name = VALUES(display_name),
+            payload = VALUES(payload),
+            local_path = VALUES(local_path),
+            source_text = VALUES(source_text),
+            created_at = VALUES(created_at)
+        """,
+        (
+            item.item_type,
+            item.channel_username,
+            item.channel_title,
+            item.channel_starred,
+            item.source_message_id,
+            item.display_name,
+            item.payload,
+            item.file_name,
+            item.local_path,
+            item.source_text,
+            item.created_at,
+        ),
+    )
     conn.commit()
 
-    async for dialog in client.iter_dialogs():
-        entity = dialog.entity
 
-        # Only process channels (not private chats / groups)
-        if not isinstance(entity, Channel):
+async def scrape_channel(client: TelegramClient, cursor, conn, channel_entity, limit: int, download_dir: str):
+    channel_username = normalize_username(channel_entity)
+    channel_title = getattr(channel_entity, "title", None) or channel_username
+    starred = 1 if channel_username in STARRED_CHANNELS else 0
+
+    collected = 0
+    async for message in client.iter_messages(channel_entity, limit=200):
+        if collected >= limit:
+            break
+
+        text = getattr(message, "message", None) or getattr(message, "text", None) or ""
+        created_at = message.date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if message.date else datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        if is_npvt_file(message):
+            file_name = getattr(getattr(message, "file", None), "name", None)
+            display_name = build_display_name(message, file_name or f"message_{message.id}.npvt")
+            local_path = None
+
+            os.makedirs(download_dir, exist_ok=True)
+            if file_name:
+                target_path = os.path.join(download_dir, file_name)
+                local_path = await client.download_media(message, file=target_path)
+            else:
+                local_path = await client.download_media(message, file=download_dir)
+
+            item = ExtractedItem(
+                item_type="napster",
+                channel_username=channel_username,
+                channel_title=channel_title,
+                channel_starred=starred,
+                source_message_id=message.id,
+                display_name=display_name,
+                payload=None,
+                file_name=file_name,
+                local_path=local_path,
+                source_text=text or None,
+                created_at=created_at,
+            )
+            await save_item(cursor, conn, item)
+            collected += 1
             continue
 
-        raw_username = getattr(entity, "username", None)
-        if not raw_username:
-            continue                           # skip channels with no public @
-
-        channel_tag = f"@{raw_username}"
-        is_stared   = channel_tag in STARED_CHANNELS
-        limit       = SPECIAL_LIMIT if channel_tag == HEX_PROXY_CHANNEL else DEFAULT_LIMIT
-
-        log.info(f"Processing {channel_tag}  (limit={limit}, stared={is_stared})")
-        found = 0
-
-        async for msg in client.iter_messages(entity, limit=200):
-            if found >= limit:
+        extracted = extract_links(text)
+        for item_type, payload in extracted:
+            if collected >= limit:
                 break
+            display_name = build_display_name(message, payload)
+            item = ExtractedItem(
+                item_type=item_type,
+                channel_username=channel_username,
+                channel_title=channel_title,
+                channel_starred=starred,
+                source_message_id=message.id,
+                display_name=display_name,
+                payload=payload,
+                file_name=None,
+                local_path=None,
+                source_text=text or None,
+                created_at=created_at,
+            )
+            await save_item(cursor, conn, item)
+            collected += 1
 
-            # ── 1. NPVT file ──────────────────────────────────────────────
-            if msg.file is not None:
-                fname = None
-                for attr in (msg.media.document.attributes if msg.media and hasattr(msg.media, "document") else []):
-                    if isinstance(attr, DocumentAttributeFilename):
-                        fname = attr.file_name
-                        break
 
-                if fname and fname.lower().endswith(".npvt"):
-                    log.info(f"  Downloading npvt: {fname}")
-                    try:
-                        buf = io.BytesIO()
-                        await client.download_media(msg, file=buf)
-                        file_bytes = buf.getvalue()
-                    except Exception as e:
-                        log.warning(f"  Failed to download {fname}: {e}")
-                        file_bytes = None
-
-                    insert_item(cur, "napster", channel_tag,
-                                fname, fname, file_bytes, is_stared)
-                    conn.commit()
-                    found += 1
-                    continue
-
-            # ── 2. Text-based content ─────────────────────────────────────
-            text = msg.text or ""
-            if not text:
-                continue
-
-            # Proxy links first
-            proxies = RE_PROXY.findall(text)
-            if proxies:
-                for proxy_url in proxies:
-                    if found >= limit:
-                        break
-                    insert_item(cur, "proxy", channel_tag,
-                                proxy_url, None, None, is_stared)
-                    conn.commit()
-                    found += 1
-                continue
-
-            # V2Ray / SS configs
-            configs = RE_CONFIG.findall(text)
-            if configs:
-                for cfg in configs:
-                    if found >= limit:
-                        break
-                    insert_item(cur, "config", channel_tag,
-                                cfg, None, None, is_stared)
-                    conn.commit()
-                    found += 1
-
-    log.info("Scrape finished.")
-
-# ──────────────────────────────────────────────────────────────────────────────
-async def main():
-    client = TelegramClient(SESSION, API_ID, API_HASH)
+async def scrape_all():
+    client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
     await client.start()
-    log.info("Telegram client started.")
 
-    conn = get_conn()
-    cur  = conn.cursor()
-    ensure_tables(cur)
-    conn.commit()
+    conn = get_connection()
+    cursor = conn.cursor()
 
+    try:
+        ensure_schema(cursor)
+        conn.commit()
+        clear_table(cursor)
+        conn.commit()
+
+        async for dialog in client.iter_dialogs():
+            if not dialog.is_channel:
+                continue
+
+            entity = dialog.entity
+            channel_username = normalize_username(entity)
+            limit = SPECIAL_LIMITS.get(channel_username, DEFAULT_LIMIT)
+            await scrape_channel(client, cursor, conn, entity, limit, DOWNLOAD_DIR)
+
+    finally:
+        cursor.close()
+        conn.close()
+        await client.disconnect()
+
+
+async def main_loop():
     while True:
-        log.info("=== Starting scheduled scrape ===")
         try:
-            await scrape_all(client, cur, conn)
-        except Exception as exc:
-            log.exception(f"Scrape error: {exc}")
-
-        log.info("Sleeping 30 minutes ...")
+            logging.info("Starting scheduled scrape")
+            await scrape_all()
+            logging.info("Scrape complete, sleeping 30 minutes")
+        except Exception:
+            logging.exception("Scrape failed")
         await asyncio.sleep(1800)
 
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    asyncio.run(main_loop())
